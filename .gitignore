@@ -1,0 +1,17 @@
+# secrets
+josh_config.json
+
+# python
+__pycache__/
+*.pyc
+
+# virtual environment
+.venv/
+
+# audio/temp
+*.wav
+*.tmp
+
+# OS junk
+Thumbs.db
+.DS_Store
