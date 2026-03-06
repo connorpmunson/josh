@@ -1,4 +1,3 @@
-# audio/tts_piper.py
 from __future__ import annotations
 
 import os
@@ -14,56 +13,13 @@ import sounddevice as sd
 import soundfile as sf
 
 
-# ----------------------------
-# Global interrupt state
-# ----------------------------
-_tts_stop_event = threading.Event()
-_tts_lock = threading.Lock()
-_tts_is_speaking = False
-
-
-def stop_speaking() -> None:
-    """
-    Immediately request TTS to stop (barge-in).
-    Safe to call from any thread.
-    """
-    _tts_stop_event.set()
-
-
-def _reset_stop_flag() -> None:
-    _tts_stop_event.clear()
-
-
-def is_speaking() -> bool:
-    return _tts_is_speaking
-
-
-# ----------------------------
-# Non-streaming: speak once (interruptible)
-# ----------------------------
 def speak_piper(text: str, *, piper_exe: Path, piper_voice: Path) -> None:
-    """
-    Offline TTS via Piper. Generates a WAV, plays it in small chunks so we can interrupt, then deletes it.
-    """
     text = (text or "").strip()
     if not text:
         return
 
-    global _tts_is_speaking
-
-    # Prevent overlapping speech threads
-    if _tts_is_speaking:
-        _tts_stop_event.set()
-        while _tts_is_speaking:
-            threading.Event().wait(0.01)
-
-    with _tts_lock:
-        _reset_stop_flag()
-
     fd, out_wav = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
-
-    _tts_is_speaking = True
 
     try:
         cmd = [str(piper_exe), "-m", str(piper_voice), "-f", out_wav, "-q"]
@@ -73,43 +29,23 @@ def speak_piper(text: str, *, piper_exe: Path, piper_voice: Path) -> None:
         if audio.ndim == 1:
             audio = audio.reshape(-1, 1)
 
-        # Play in chunks so we can stop mid-utterance
-        block = 2048
-        with sd.OutputStream(samplerate=sr, channels=1, dtype="int16", blocksize=block) as out:
-            n = audio.shape[0]
-            i = 0
-            while i < n:
-                if _tts_stop_event.is_set():
-                    break
-                j = min(i + block, n)
-                out.write(audio[i:j])
-                i = j
-
+        with sd.OutputStream(samplerate=sr, channels=1, dtype="int16", blocksize=8192) as out:
+            out.write(audio)
     finally:
-        _tts_is_speaking = False
         try:
             os.remove(out_wav)
         except OSError:
             pass
-        # keep stop flag as-is (caller may want it set). next speak resets.
 
 
 def say(text: str, settings) -> None:
     speak_piper(text, piper_exe=settings.piper_exe, piper_voice=settings.piper_voice)
 
 
-# ----------------------------
-# Streaming: speak as text arrives (interruptible)
-# ----------------------------
 _SENT_END_RE = re.compile(r"([.!?]+)(\s+|$)")
 
 
-def _tts_worker(
-    q: Queue[Optional[str]],
-    *,
-    piper_exe: Path,
-    piper_voice: Path,
-):
+def _tts_worker(q: Queue[Optional[str]], *, piper_exe: Path, piper_voice: Path):
     buf = ""
 
     def flush_sentence(sentence: str):
@@ -119,23 +55,14 @@ def _tts_worker(
 
     while True:
         item = q.get()
-
         if item is None:
-            if _tts_stop_event.is_set():
-                return
             if buf.strip():
                 flush_sentence(buf)
-            return
-
-        if _tts_stop_event.is_set():
             return
 
         buf += item
 
         while True:
-            if _tts_stop_event.is_set():
-                return
-
             m = _SENT_END_RE.search(buf)
             if not m:
                 break
@@ -172,15 +99,19 @@ def stream_to_piper(
         for delta in brain.think_stream(user_text, short_history, long_mem):
             if not delta:
                 continue
-            if _tts_stop_event.is_set():
-                break
-
             print(delta, end="", flush=True)
             full += delta
             q.put(delta)
-
     finally:
         q.put(None)
         worker.join()
 
-    return full.strip()
+    final = full.strip()
+
+    # Failsafe: if streaming yielded nothing, do one normal call and speak it.
+    if not final:
+        final = (brain.think(user_text, short_history, long_mem) or "").strip()
+        if final:
+            speak_piper(final, piper_exe=piper_exe, piper_voice=piper_voice)
+
+    return final

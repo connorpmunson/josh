@@ -1,28 +1,22 @@
 from __future__ import annotations
 
 import time
-import threading
+import sys
+
 from core.settings import load_settings
 from core.brain import Brain
 from core.memory import LongTermMemory
 from wakeword.porcupine_listener import wait_for_wake_word
 from audio.recorder import record_wav
 from speech.stt_whisper import WhisperSTT
-from tools.router import route
-from tools.llm_tool_router import decide_tool
+from audio.tts_piper import say, stream_to_piper
+
+from tools.planner import decide_plan
 from tools.time_tool import get_time_string
 from tools.web_tool import web_search
-from audio.tts_piper import say, stream_to_piper, stop_speaking
-from wakeword.interrupt_listener import wait_for_wake_word_interrupt
 
-# ---- FLAGS ----
-import sys
+
 TEXT_ONLY = "--text" in sys.argv
-
-
-# ---- MODES ----
-MODE_ALEXA = "alexa"
-MODE_EXTENDED = "extended"
 
 OPEN_EXTENDED_PHRASES = (
     "open extended dialogue",
@@ -34,8 +28,6 @@ CLOSE_EXTENDED_PHRASES = (
     "that will be all",
 )
 
-
-# ---------------- HELPER ----------------
 
 def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
     t = (text or "").lower().strip()
@@ -55,47 +47,36 @@ def maybe_store_memory(user_text: str, long_mem: LongTermMemory):
         "store that",
         "save this",
     )
-    lower = user_text.lower()
+    lower = (user_text or "").lower()
     if any(t in lower for t in triggers):
         long_mem.add_fact(user_text)
 
-def _start_barge_in_listener(settings):
-    if TEXT_ONLY:
-        stop_evt = threading.Event()
-        return stop_evt, threading.Thread()
-    """
-    Starts a background wake-word listener that, if triggered,
-    calls stop_speaking() to immediately cut TTS.
-    Returns (stop_event, listener_thread).
-    """
-    stop_evt = threading.Event()
 
-    listener = threading.Thread(
-        target=wait_for_wake_word_interrupt,
-        args=(settings.picovoice_access_key, settings.keyword_path, stop_evt),
-        daemon=True,
+def _answer_from_web(brain: Brain, user_text: str, raw_snippets: str, short_history, long_mem) -> str:
+    prompt = (
+        "You are J.O.S.H. Answer in ONE short sentence.\n"
+        "Use the web snippets below to answer the user's question.\n"
+        "You MAY do simple arithmetic if the needed numbers appear in the snippets "
+        "(example: '$20/month' implies '$240/year').\n"
+        "If a price is requested, return ONLY the price and the billing period (e.g., '$20/month' or '$240/year').\n"
+        "If the snippets don't contain the needed facts AND you can't derive it from snippet values, say you couldn't find it.\n\n"
+        f"User question: {user_text}\n\n"
+        f"Web snippets:\n{raw_snippets}\n\n"
+        "Answer:"
     )
-    listener.start()
+    # Stream this too, so web answers are fast.
+    print("J.O.S.H.: ", end="", flush=True)
+    reply = stream_to_piper(
+        brain,
+        prompt,
+        short_history,
+        long_mem,
+        piper_exe=brain_settings.piper_exe,   # set below
+        piper_voice=brain_settings.piper_voice,
+    )
+    print()
+    return reply.strip()
 
-    def _watch():
-        stop_evt.wait()
-        stop_speaking()
-
-    threading.Thread(target=_watch, daemon=True).start()
-
-    return stop_evt, listener
-
-
-def _say_with_barge_in(text: str, settings):
-    stop_evt, listener = _start_barge_in_listener(settings)
-    try:
-        say(text, settings)
-    finally:
-        stop_evt.set()
-        if listener.is_alive():
-            listener.join(timeout=0.2)
-
-# ---------------- EXTENDED DIALOGUE ----------------
 
 def dialogue_loop(
     settings,
@@ -107,6 +88,8 @@ def dialogue_loop(
     *,
     announce_listening: bool = True,
 ):
+    global brain_settings
+    brain_settings = settings
 
     if announce_listening:
         print("J.O.S.H.: I'm listening, sir.")
@@ -116,7 +99,6 @@ def dialogue_loop(
     pre = first_pre_roll
 
     while True:
-
         if time.time() - last_activity > settings.idle_timeout_seconds:
             print("J.O.S.H.: Idle timeout reached. Shutting down, sir.")
             say("Idle. Shutting down, sir.", settings)
@@ -150,13 +132,7 @@ def dialogue_loop(
         lower = user_text.lower().strip()
 
         # ---- EXIT EXTENDED MODE ----
-        if _contains_any_phrase(lower, CLOSE_EXTENDED_PHRASES):
-            print("J.O.S.H.: Understood, sir.")
-            say("Understood, sir.", settings)
-            return
-
-        # ---- HARD COMMANDS ----
-        if "go to sleep" in lower:
+        if _contains_any_phrase(lower, CLOSE_EXTENDED_PHRASES) or "go to sleep" in lower:
             print("J.O.S.H.: Understood, sir.")
             say("Understood, sir.", settings)
             return
@@ -166,100 +142,63 @@ def dialogue_loop(
             say("Shutting down. Goodbye, sir.", settings)
             return "exit"
 
-        # ---- TOOL ROUTING ----
-        decision = decide_tool(settings.openai_api_key, user_text)
+        # ---- PLAN ----
+        plan = decide_plan(settings.openai_api_key, user_text)
 
-        if decision.tool == "time":
-            reply = get_time_string(decision.timezone)
+        # ---- TOOLS (only if needed) ----
+        if plan.needs_tools and plan.tools == ["time"]:
+            reply = get_time_string(plan.timezone)
             print(f"J.O.S.H.: {reply}")
-            _say_with_barge_in(reply, settings)
+            say(reply, settings)
+
             short_history.append((user_text, reply))
             last_activity = time.time()
             maybe_store_memory(user_text, long_mem)
             long_mem.save(settings.memory_file)
             continue
 
-        if decision.tool == "web" and decision.query:
-            raw = web_search(decision.query)
+        if plan.needs_tools and "web" in plan.tools:
+            raw = web_search(plan.web_query or user_text)
+            reply = _answer_from_web(brain, user_text, raw, short_history, long_mem)
 
-            # Ask the LLM to extract the one useful answer from the snippets.
-            prompt = (
-                "You are J.O.S.H. Answer in ONE short sentence.\n"
-                "Use the web snippets below to answer the user's question.\n"
-                "If a price is requested, return ONLY the price and the billing period (e.g., '$20/month').\n"
-                "If the snippets don't contain the answer, say you couldn't find it.\n\n"
-                f"User question: {user_text}\n\n"
-                f"Web snippets:\n{raw}\n\n"
-                "Answer:"
-            )
-
-            reply = brain.think(prompt, short_history, long_mem)
-            print(f"J.O.S.H.: {reply}")
-            _say_with_barge_in(reply, settings)
             short_history.append((user_text, reply))
             last_activity = time.time()
             maybe_store_memory(user_text, long_mem)
             long_mem.save(settings.memory_file)
             continue
 
-        # fallback: your existing regex router
-        tool_result = route(user_text)
-        if tool_result.handled:
-            reply = tool_result.text.strip()
-
-            # If web tool returned snippets, summarize them before speaking.
-            if tool_result.tool_name == "web_tool":
-                prompt = (
-                    "You are J.O.S.H. Answer in ONE short sentence.\n"
-                    "Use the web snippets below to answer the user's question.\n"
-                    "If a price is requested, return ONLY the price and the billing period (e.g., '$20/month').\n"
-                    "If the snippets don't contain the answer, say you couldn't find it.\n\n"
-                    f"User question: {user_text}\n\n"
-                    f"Web snippets:\n{reply}\n\n"
-                    "Answer:"
-                )
-
-                reply = brain.think(prompt, short_history, long_mem).strip()
-
+        if plan.needs_tools and plan.tools == ["weather"]:
+            reply = "Weather tool not installed yet, sir."
             print(f"J.O.S.H.: {reply}")
-            _say_with_barge_in(reply, settings)
+            say(reply, settings)
+
             short_history.append((user_text, reply))
             last_activity = time.time()
             maybe_store_memory(user_text, long_mem)
             long_mem.save(settings.memory_file)
             continue
 
-        # ---- LLM RESPONSE ----
+        # ---- NORMAL LLM (streaming) ----
         print("J.O.S.H.: ", end="", flush=True)
-        stop_evt, listener = _start_barge_in_listener(settings)
-        try:
-            reply = stream_to_piper(
-                brain,
-                user_text,
-                short_history,
-                long_mem,
-                piper_exe=settings.piper_exe,
-                piper_voice=settings.piper_voice,
-            )
-        finally:
-            stop_evt.set()
-            if listener.is_alive():
-                listener.join(timeout=0.2)
+        reply = stream_to_piper(
+            brain,
+            user_text,
+            short_history,
+            long_mem,
+            piper_exe=settings.piper_exe,
+            piper_voice=settings.piper_voice,
+        )
         print()
 
         short_history.append((user_text, reply))
         last_activity = time.time()
-
         maybe_store_memory(user_text, long_mem)
         long_mem.save(settings.memory_file)
 
 
-# ---------------- ALEXA MODE ----------------
-
 def alexa_turn(settings, brain: Brain, stt: WhisperSTT, short_history, long_mem: LongTermMemory, first_pre_roll=None):
-
-    #print("J.O.S.H.: I'm listening, sir.")
-    #say("I'm listening, sir.", settings)
+    global brain_settings
+    brain_settings = settings
 
     # ---- INPUT ONCE ----
     if TEXT_ONLY:
@@ -298,7 +237,6 @@ def alexa_turn(settings, brain: Brain, stt: WhisperSTT, short_history, long_mem:
     if _contains_any_phrase(lower, OPEN_EXTENDED_PHRASES):
         print("J.O.S.H.: Extended dialogue activated, sir.")
         say("Extended dialogue activated, sir.", settings)
-
         return dialogue_loop(
             settings,
             brain,
@@ -315,82 +253,47 @@ def alexa_turn(settings, brain: Brain, stt: WhisperSTT, short_history, long_mem:
         say("Understood, sir.", settings)
         return None
 
-    # ---- TOOL ROUTING ----
-    decision = decide_tool(settings.openai_api_key, user_text)
+    # ---- PLAN ----
+    plan = decide_plan(settings.openai_api_key, user_text)
 
-    if decision.tool == "time":
-        reply = get_time_string(decision.timezone)
+    # ---- TOOLS (only if needed) ----
+    if plan.needs_tools and plan.tools == ["time"]:
+        reply = get_time_string(plan.timezone)
         print(f"J.O.S.H.: {reply}")
-        _say_with_barge_in(reply, settings)
+        say(reply, settings)
         short_history.append((user_text, reply))
         maybe_store_memory(user_text, long_mem)
         long_mem.save(settings.memory_file)
         return None
 
-    if decision.tool == "web" and decision.query:
-        raw = web_search(decision.query)
+    if plan.needs_tools and "web" in plan.tools:
+        raw = web_search(plan.web_query or user_text)
+        reply = _answer_from_web(brain, user_text, raw, short_history, long_mem)
 
-        # Ask the LLM to extract the one useful answer from the snippets.
-        prompt = (
-            "You are J.O.S.H. Answer in ONE short sentence.\n"
-            "Use the web snippets below to answer the user's question.\n"
-            "If a price is requested, return ONLY the price and the billing period (e.g., '$20/month').\n"
-            "If the snippets don't contain the answer, say you couldn't find it.\n\n"
-            f"User question: {user_text}\n\n"
-            f"Web snippets:\n{raw}\n\n"
-            "Answer:"
-        )
-
-        reply = brain.think(prompt, short_history, long_mem)
-
-        print(f"J.O.S.H.: {reply}")
-        _say_with_barge_in(reply, settings)
         short_history.append((user_text, reply))
         maybe_store_memory(user_text, long_mem)
         long_mem.save(settings.memory_file)
         return None
 
-    # fallback: existing regex router
-    tool_result = route(user_text)
-    if tool_result.handled:
-        reply = tool_result.text.strip()
-
-        if tool_result.tool_name == "web_tool":
-            prompt = (
-                "You are J.O.S.H. Answer in ONE short sentence.\n"
-                "Use the web snippets below to answer the user's question.\n"
-                "If a price is requested, return ONLY the price and the billing period (e.g., '$20/month').\n"
-                "If the snippets don't contain the answer, say you couldn't find it.\n\n"
-                f"User question: {user_text}\n\n"
-                f"Web snippets:\n{reply}\n\n"
-                "Answer:"
-            )
-
-            reply = brain.think(prompt, short_history, long_mem).strip()
-
+    if plan.needs_tools and plan.tools == ["weather"]:
+        reply = "Weather tool not installed yet, sir."
         print(f"J.O.S.H.: {reply}")
-        _say_with_barge_in(reply, settings)
+        say(reply, settings)
         short_history.append((user_text, reply))
         maybe_store_memory(user_text, long_mem)
         long_mem.save(settings.memory_file)
         return None
 
-    # ---- LLM RESPONSE (ONE TURN) ----
+    # ---- NORMAL LLM (streaming) ----
     print("J.O.S.H.: ", end="", flush=True)
-    stop_evt, listener = _start_barge_in_listener(settings)
-    try:
-        reply = stream_to_piper(
-            brain,
-            user_text,
-            short_history,
-            long_mem,
-            piper_exe=settings.piper_exe,
-            piper_voice=settings.piper_voice,
-        )
-    finally:
-        stop_evt.set()
-        if listener.is_alive():
-            listener.join(timeout=0.2)
+    reply = stream_to_piper(
+        brain,
+        user_text,
+        short_history,
+        long_mem,
+        piper_exe=settings.piper_exe,
+        piper_voice=settings.piper_voice,
+    )
     print()
 
     short_history.append((user_text, reply))
@@ -399,8 +302,6 @@ def alexa_turn(settings, brain: Brain, stt: WhisperSTT, short_history, long_mem:
 
     return None
 
-
-# ---------------- MAIN ----------------
 
 def main():
     settings = load_settings()
@@ -416,17 +317,14 @@ def main():
     )
 
     while True:
-
         if TEXT_ONLY:
             result = alexa_turn(settings, brain, stt, short_history, long_mem, first_pre_roll=None)
-
         else:
             pre_roll = wait_for_wake_word(
                 access_key=settings.picovoice_access_key,
                 keyword_path=settings.keyword_path,
                 pre_roll_seconds=settings.pre_roll_seconds,
             )
-
             result = alexa_turn(settings, brain, stt, short_history, long_mem, first_pre_roll=pre_roll)
 
         if result == "exit":
